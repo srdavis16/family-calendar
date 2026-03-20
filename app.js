@@ -1,12 +1,17 @@
 // ─────────────────────────────────────────────────────────
 //  FAMILY CALENDAR — MAIN APP
 // ─────────────────────────────────────────────────────────
-let tokenClient, gapiInited = false, gisInited = false;
+// ─────────────────────────────────────────────────────────
+//  FAMILY CALENDAR — MAIN APP
+// ─────────────────────────────────────────────────────────
+
+let gapiInited = false;
 let currentView = 'week';
 let currentDate = new Date();
 let events = [];
 let editingEventId = null;
 let hiddenMembers = new Set();
+
 // ─── Google API Init ──────────────────────────────────────
 function gapiLoaded() {
   gapi.load('client', async () => {
@@ -15,64 +20,90 @@ function gapiLoaded() {
       discoveryDocs: [CONFIG.DISCOVERY_DOC],
     });
     gapiInited = true;
-    maybeEnableButtons();
+    checkStoredToken();
   });
 }
 
-function gisLoaded() {
-  tokenClient = google.accounts.oauth2.initTokenClient({
+// ─── Redirect-based Auth ──────────────────────────────────
+// Replaces the popup flow (which COOP policy blocks on GitHub Pages).
+// We redirect to Google, receive the token back in the URL hash,
+// store it in sessionStorage, and restore it on the next load.
+
+function buildAuthUrl() {
+  const params = new URLSearchParams({
     client_id: CONFIG.GOOGLE_CLIENT_ID,
+    redirect_uri: window.location.origin + window.location.pathname,
+    response_type: 'token',
     scope: CONFIG.SCOPES,
-    callback: async (resp) => {
-      if (resp.error) {
-        console.error('OAuth error:', resp.error);
-        showToast('Sign-in failed. Please try again.');
-        return;
-      }
-      showApp();
-      await loadEvents();
-    },
+    include_granted_scopes: 'true',
   });
-  gisInited = true;
-  maybeEnableButtons();
+  return `https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`;
 }
 
-function maybeEnableButtons() {
-  if (gapiInited && gisInited) {
-    document.getElementById('sign-in-btn').disabled = false;
-    // Auto-sign in if token exists
-    const token = gapi.client.getToken();
-    if (token !== null) { showApp(); loadEvents(); }
-  }
+function handleRedirectToken() {
+  // After Google redirects back, the access token is in the URL hash
+  const hash = window.location.hash.substring(1);
+  if (!hash) return false;
+  const params = new URLSearchParams(hash);
+  const accessToken = params.get('access_token');
+  const expiresIn = params.get('expires_in');
+  if (!accessToken) return false;
+
+  // Store token and expiry time in sessionStorage
+  const expiresAt = Date.now() + parseInt(expiresIn) * 1000;
+  sessionStorage.setItem('gapi_token', accessToken);
+  sessionStorage.setItem('gapi_token_expires', expiresAt);
+
+  // Remove the token from the URL bar so it's not visible or bookmarked
+  history.replaceState(null, '', window.location.pathname);
+  return true;
 }
 
-// ─── Auth ──────────────────────────────────────────────────
-document.getElementById('sign-in-btn').addEventListener('click', () => {
-  if (gapi.client.getToken() === null) {
-    tokenClient.requestAccessToken({ prompt: 'select_account' });
+function checkStoredToken() {
+  const token = sessionStorage.getItem('gapi_token');
+  const expiresAt = parseInt(sessionStorage.getItem('gapi_token_expires') || '0');
+
+  if (token && Date.now() < expiresAt) {
+    // Valid token found — apply it to gapi and load the app
+    gapi.client.setToken({ access_token: token });
+    showApp();
+    loadEvents();
   } else {
-    tokenClient.requestAccessToken({ prompt: '' });
+    // No valid token — clear stale data and show sign-in screen
+    sessionStorage.removeItem('gapi_token');
+    sessionStorage.removeItem('gapi_token_expires');
+    document.getElementById('sign-in-btn').disabled = false;
   }
+}
+
+// Run immediately on page load to catch the token from Google's redirect
+handleRedirectToken();
+
+// ─── Auth Buttons ─────────────────────────────────────────
+document.getElementById('sign-in-btn').addEventListener('click', () => {
+  window.location.href = buildAuthUrl();
 });
 
 document.getElementById('sign-out-btn').addEventListener('click', () => {
-  const token = gapi.client.getToken();
-  if (token !== null) {
-    google.accounts.oauth2.revoke(token.access_token, () => {
-      gapi.client.setToken('');
-      document.getElementById('auth-screen').classList.add('active');
-      document.getElementById('main-screen').classList.remove('active');
-    });
+  const token = sessionStorage.getItem('gapi_token');
+  if (token) {
+    fetch(`https://oauth2.googleapis.com/revoke?token=${token}`, { method: 'POST' })
+      .finally(() => {
+        sessionStorage.removeItem('gapi_token');
+        sessionStorage.removeItem('gapi_token_expires');
+        gapi.client.setToken('');
+        document.getElementById('auth-screen').classList.add('active');
+        document.getElementById('main-screen').classList.remove('active');
+      });
   }
 });
 
 function showApp() {
   document.getElementById('auth-screen').classList.remove('active');
   document.getElementById('main-screen').classList.add('active');
-  gapi.client.people?.profiles.get({ resourceName: 'people/me' });
-  // Try to get user name
+  const token = sessionStorage.getItem('gapi_token');
   fetch('https://www.googleapis.com/oauth2/v2/userinfo', {
-    headers: { Authorization: `Bearer ${gapi.client.getToken().access_token}` }
+    headers: { Authorization: `Bearer ${token}` }
   }).then(r => r.json()).then(u => {
     const name = u.given_name || u.name || 'You';
     document.getElementById('user-name').textContent = name;
@@ -82,8 +113,8 @@ function showApp() {
 
 // ─── Load Events ───────────────────────────────────────────
 async function loadEvents() {
-  const token = gapi.client.getToken();
-  if (!token || !token.access_token) {
+  const token = sessionStorage.getItem('gapi_token');
+  if (!token) {
     console.warn('loadEvents called without a valid token — skipping.');
     return;
   }
@@ -227,7 +258,6 @@ function openModal(opts = {}) {
   document.getElementById('event-reminder').value = opts.reminder || 10;
   toggleTimeFields(!opts.allDay);
 
-  // Member buttons
   document.querySelectorAll('.member-btn').forEach(btn => {
     btn.classList.toggle('active', btn.dataset.member === (opts.member || 'Madeleine'));
   });
@@ -282,12 +312,8 @@ document.querySelectorAll('.nav-btn').forEach(btn => {
   });
 });
 
-document.getElementById('prev-btn').addEventListener('click', () => {
-  navigate(-1);
-});
-document.getElementById('next-btn').addEventListener('click', () => {
-  navigate(1);
-});
+document.getElementById('prev-btn').addEventListener('click', () => navigate(-1));
+document.getElementById('next-btn').addEventListener('click', () => navigate(1));
 document.getElementById('today-btn').addEventListener('click', () => {
   currentDate = new Date();
   renderCurrentView();
@@ -360,7 +386,6 @@ function renderWeek() {
   const start = getWeekStart(currentDate);
   const today = new Date(); today.setHours(0,0,0,0);
 
-  // Headers
   const headerEl = document.getElementById('week-days-header');
   headerEl.innerHTML = '';
   for (let i = 0; i < 7; i++) {
@@ -372,7 +397,6 @@ function renderWeek() {
     headerEl.appendChild(div);
   }
 
-  // Time labels
   const timeCol = document.getElementById('time-column');
   timeCol.innerHTML = '';
   HOURS.forEach(h => {
@@ -382,7 +406,6 @@ function renderWeek() {
     timeCol.appendChild(label);
   });
 
-  // Day columns
   const bodyEl = document.getElementById('week-body');
   bodyEl.innerHTML = '';
   for (let i = 0; i < 7; i++) {
@@ -391,7 +414,6 @@ function renderWeek() {
     col.className = 'week-day-col';
     col.style.height = `${60 * 24}px`;
 
-    // Hour lines
     HOURS.forEach(h => {
       const line = document.createElement('div');
       line.className = 'hour-line';
@@ -399,7 +421,6 @@ function renderWeek() {
       col.appendChild(line);
     });
 
-    // Click to add
     col.addEventListener('click', (e) => {
       if (e.target.classList.contains('week-event')) return;
       const rect = col.getBoundingClientRect();
@@ -416,7 +437,6 @@ function renderWeek() {
       });
     });
 
-    // Events for this day
     const dayEvents = visibleEvents().filter(ev => {
       if (ev.allDay) return false;
       const evDate = new Date(ev.start); evDate.setHours(0,0,0,0);
@@ -501,10 +521,7 @@ function renderMonth() {
       cell.appendChild(more);
     }
 
-    cell.addEventListener('click', () => {
-      openModal({ date: formatDate(d) });
-    });
-
+    cell.addEventListener('click', () => openModal({ date: formatDate(d) }));
     grid.appendChild(cell);
   }
 }
@@ -623,17 +640,12 @@ function showToast(msg) {
   setTimeout(() => t.classList.add('hidden'), 2800);
 }
 
-// ─── Load Google APIs ────────────────────────────────────────
+// ─── Load Google API ─────────────────────────────────────────
 (function loadGoogleAPIs() {
   const gapiScript = document.createElement('script');
   gapiScript.src = 'https://apis.google.com/js/api.js';
   gapiScript.onload = gapiLoaded;
   document.head.appendChild(gapiScript);
-
-  const gisScript = document.createElement('script');
-  gisScript.src = 'https://accounts.google.com/gsi/client';
-  gisScript.onload = gisLoaded;
-  document.head.appendChild(gisScript);
 })();
 
 // Initial render

@@ -1,14 +1,15 @@
-// ---------------------------------------------------------
-//  FAMILY CALENDAR - MAIN APP
-// ---------------------------------------------------------
+// ─────────────────────────────────────────────────────────
+//  FAMILY CALENDAR — MAIN APP
+// ─────────────────────────────────────────────────────────
 
-let tokenClient, gapiInited = false, gisInited = false;
+let gapiInited = false;
 let currentView = 'week';
 let currentDate = new Date();
 let events = [];
 let editingEventId = null;
 let hiddenMembers = new Set();
 
+// --- Google API + Redirect Auth -------------------------
 function gapiLoaded() {
   gapi.load('client', async () => {
     await gapi.client.init({
@@ -16,57 +17,77 @@ function gapiLoaded() {
       discoveryDocs: [CONFIG.DISCOVERY_DOC],
     });
     gapiInited = true;
-    maybeEnableButtons();
+    checkStoredToken();
   });
 }
 
-function gisLoaded() {
-  tokenClient = google.accounts.oauth2.initTokenClient({
+function buildAuthUrl() {
+  const params = new URLSearchParams({
     client_id: CONFIG.GOOGLE_CLIENT_ID,
+    redirect_uri: window.location.origin + window.location.pathname,
+    response_type: 'token',
     scope: CONFIG.SCOPES,
-    callback: async (resp) => {
-      if (resp.error) { console.error(resp); return; }
-      showApp();
-      await loadEvents();
-    },
+    include_granted_scopes: 'true',
   });
-  gisInited = true;
-  maybeEnableButtons();
+  return 'https://accounts.google.com/o/oauth2/v2/auth?' + params.toString();
 }
 
-function maybeEnableButtons() {
-  if (gapiInited && gisInited) {
-    document.getElementById('sign-in-btn').disabled = false;
-    const token = gapi.client.getToken();
-    if (token !== null) { showApp(); loadEvents(); }
-  }
+function handleRedirectToken() {
+  const hash = window.location.hash.substring(1);
+  if (!hash) return false;
+  const params = new URLSearchParams(hash);
+  const accessToken = params.get('access_token');
+  const expiresIn = params.get('expires_in');
+  if (!accessToken) return false;
+  const expiresAt = Date.now() + parseInt(expiresIn) * 1000;
+  sessionStorage.setItem('gapi_token', accessToken);
+  sessionStorage.setItem('gapi_token_expires', String(expiresAt));
+  history.replaceState(null, '', window.location.pathname);
+  return true;
 }
 
-document.getElementById('sign-in-btn').addEventListener('click', () => {
-  if (gapi.client.getToken() === null) {
-    tokenClient.requestAccessToken({ prompt: 'consent' });
+function checkStoredToken() {
+  const token = sessionStorage.getItem('gapi_token');
+  const expiresAt = parseInt(sessionStorage.getItem('gapi_token_expires') || '0');
+  if (token && Date.now() < expiresAt) {
+    gapi.client.setToken({ access_token: token });
+    showApp(token);
+    loadEvents();
   } else {
-    tokenClient.requestAccessToken({ prompt: '' });
+    sessionStorage.removeItem('gapi_token');
+    sessionStorage.removeItem('gapi_token_expires');
+    document.getElementById('sign-in-btn').disabled = false;
   }
+}
+
+// Grab token from URL hash right away on page load
+handleRedirectToken();
+
+// --- Auth Buttons ----------------------------------------
+document.getElementById('sign-in-btn').addEventListener('click', () => {
+  window.location.href = buildAuthUrl();
 });
 
 document.getElementById('sign-out-btn').addEventListener('click', () => {
-  const token = gapi.client.getToken();
-  if (token !== null) {
-    google.accounts.oauth2.revoke(token.access_token, () => {
-      gapi.client.setToken('');
-      document.getElementById('auth-screen').classList.add('active');
-      document.getElementById('main-screen').classList.remove('active');
-    });
+  const token = sessionStorage.getItem('gapi_token');
+  if (token) {
+    fetch('https://oauth2.googleapis.com/revoke?token=' + token, { method: 'POST' })
+      .finally(() => {
+        sessionStorage.removeItem('gapi_token');
+        sessionStorage.removeItem('gapi_token_expires');
+        gapi.client.setToken('');
+        document.getElementById('auth-screen').classList.add('active');
+        document.getElementById('main-screen').classList.remove('active');
+      });
   }
 });
 
-function showApp() {
+function showApp(token) {
   document.getElementById('auth-screen').classList.remove('active');
   document.getElementById('main-screen').classList.add('active');
-  gapi.client.people?.profiles.get({ resourceName: 'people/me' });
+  const t = token || sessionStorage.getItem('gapi_token');
   fetch('https://www.googleapis.com/oauth2/v2/userinfo', {
-    headers: { Authorization: `Bearer ${gapi.client.getToken().access_token}` }
+    headers: { Authorization: 'Bearer ' + t }
   }).then(r => r.json()).then(u => {
     const name = u.given_name || u.name || 'You';
     document.getElementById('user-name').textContent = name;
@@ -74,23 +95,45 @@ function showApp() {
   }).catch(() => {});
 }
 
+// ─── Load Events ───────────────────────────────────────────
 async function loadEvents() {
+  const token = sessionStorage.getItem("gapi_token");
+  if (!token) return;
+  events = [];
   try {
     const now = new Date();
     const start = new Date(now.getFullYear(), now.getMonth() - 2, 1);
     const end = new Date(now.getFullYear(), now.getMonth() + 4, 0);
 
-    const resp = await gapi.client.calendar.events.list({
-      calendarId: 'primary',
-      timeMin: start.toISOString(),
-      timeMax: end.toISOString(),
-      showDeleted: false,
-      singleEvents: true,
-      maxResults: 500,
-      orderBy: 'startTime',
+    // Step 1: get all calendars the user has access to
+    const calList = await gapi.client.calendar.calendarList.list();
+    const calendars = (calList.result.items || []).filter(cal => cal.selected !== false);
+
+    // Step 2: fetch events from every calendar in parallel
+    const allResults = await Promise.all(
+      calendars.map(cal =>
+        gapi.client.calendar.events.list({
+          calendarId: cal.id,
+          timeMin: start.toISOString(),
+          timeMax: end.toISOString(),
+          showDeleted: false,
+          singleEvents: true,
+          maxResults: 500,
+          orderBy: 'startTime',
+        }).then(resp => (resp.result.items || []).map(e => parseGoogleEvent(e)))
+          .catch(() => []) // skip calendars that fail (e.g. no permission)
+      )
+    );
+
+    // Step 3: flatten and deduplicate by event id
+    const seen = new Set();
+    events = allResults.flat().filter(ev => {
+      if (seen.has(ev.id)) return false;
+      seen.add(ev.id);
+      return true;
     });
 
-    events = (resp.result.items || []).map(e => parseGoogleEvent(e));
+    console.log('Loaded', events.length, 'events from', calendars.length, 'calendars');
     renderCurrentView();
   } catch (err) {
     console.error('Error loading events:', err);
@@ -123,9 +166,10 @@ function detectMember(title, desc) {
   for (const name of Object.keys(CONFIG.MEMBERS)) {
     if (text.includes(name.toLowerCase())) return name;
   }
-  return 'Madeleine';
+  return 'Madeleine'; // default
 }
 
+// ─── Save Event ────────────────────────────────────────────
 async function saveEvent() {
   const title = document.getElementById('event-title').value.trim();
   if (!title) { showToast('Please enter a title'); return; }
@@ -167,13 +211,13 @@ async function saveEvent() {
         eventId: editingEventId,
         resource: eventBody,
       });
-      showToast('Event updated');
+      showToast('Event updated ✓');
     } else {
       await gapi.client.calendar.events.insert({
         calendarId: 'primary',
         resource: eventBody,
       });
-      showToast('Event added');
+      showToast('Event added ✓');
     }
     closeModal();
     await loadEvents();
@@ -183,6 +227,7 @@ async function saveEvent() {
   }
 }
 
+// ─── Delete Event ──────────────────────────────────────────
 async function deleteEvent() {
   if (!editingEventId) return;
   if (!confirm('Delete this event?')) return;
@@ -199,6 +244,7 @@ async function deleteEvent() {
   }
 }
 
+// ─── Modal ──────────────────────────────────────────────────
 function openModal(opts = {}) {
   editingEventId = opts.id || null;
   document.getElementById('modal-title').textContent = opts.id ? 'Edit Event' : 'New Event';
@@ -211,6 +257,7 @@ function openModal(opts = {}) {
   document.getElementById('event-reminder').value = opts.reminder || 10;
   toggleTimeFields(!opts.allDay);
 
+  // Member buttons
   document.querySelectorAll('.member-btn').forEach(btn => {
     btn.classList.toggle('active', btn.dataset.member === (opts.member || 'Madeleine'));
   });
@@ -253,6 +300,7 @@ document.querySelectorAll('.member-btn').forEach(btn => {
   });
 });
 
+// ─── Views ──────────────────────────────────────────────────
 document.querySelectorAll('.nav-btn').forEach(btn => {
   btn.addEventListener('click', () => {
     document.querySelectorAll('.nav-btn').forEach(b => b.classList.remove('active'));
@@ -264,8 +312,12 @@ document.querySelectorAll('.nav-btn').forEach(btn => {
   });
 });
 
-document.getElementById('prev-btn').addEventListener('click', () => { navigate(-1); });
-document.getElementById('next-btn').addEventListener('click', () => { navigate(1); });
+document.getElementById('prev-btn').addEventListener('click', () => {
+  navigate(-1);
+});
+document.getElementById('next-btn').addEventListener('click', () => {
+  navigate(1);
+});
 document.getElementById('today-btn').addEventListener('click', () => {
   currentDate = new Date();
   renderCurrentView();
@@ -282,6 +334,7 @@ function navigate(dir) {
   renderCurrentView();
 }
 
+// ─── Member Filters ─────────────────────────────────────────
 document.querySelectorAll('.member-toggle').forEach(toggle => {
   toggle.addEventListener('change', () => {
     if (toggle.checked) hiddenMembers.delete(toggle.dataset.member);
@@ -294,6 +347,7 @@ function visibleEvents() {
   return events.filter(e => !hiddenMembers.has(e.member));
 }
 
+// ─── Render ─────────────────────────────────────────────────
 function renderCurrentView() {
   updateHeaderTitle();
   if (currentView === 'week') renderWeek();
@@ -308,9 +362,9 @@ function updateHeaderTitle() {
     const start = getWeekStart(currentDate);
     const end = new Date(start); end.setDate(end.getDate() + 6);
     if (start.getMonth() === end.getMonth()) {
-      el.textContent = `${start.toLocaleDateString('en-US', { month: 'long' })} ${start.getDate()}-${end.getDate()}, ${start.getFullYear()}`;
+      el.textContent = `${start.toLocaleDateString('en-US', { month: 'long' })} ${start.getDate()}–${end.getDate()}, ${start.getFullYear()}`;
     } else {
-      el.textContent = `${start.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })} - ${end.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })}`;
+      el.textContent = `${start.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })} – ${end.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })}`;
     }
   } else if (currentView === 'month') {
     el.textContent = currentDate.toLocaleDateString('en-US', opts);
@@ -319,6 +373,7 @@ function updateHeaderTitle() {
   }
 }
 
+// ── Week View ────────────────────────────────────────────────
 function getWeekStart(d) {
   const day = new Date(d);
   const diff = day.getDay();
@@ -335,6 +390,7 @@ function renderWeek() {
   const start = getWeekStart(currentDate);
   const today = new Date(); today.setHours(0,0,0,0);
 
+  // Headers
   const headerEl = document.getElementById('week-days-header');
   headerEl.innerHTML = '';
   for (let i = 0; i < 7; i++) {
@@ -346,6 +402,7 @@ function renderWeek() {
     headerEl.appendChild(div);
   }
 
+  // Time labels
   const timeCol = document.getElementById('time-column');
   timeCol.innerHTML = '';
   HOURS.forEach(h => {
@@ -355,6 +412,7 @@ function renderWeek() {
     timeCol.appendChild(label);
   });
 
+  // Day columns
   const bodyEl = document.getElementById('week-body');
   bodyEl.innerHTML = '';
   for (let i = 0; i < 7; i++) {
@@ -363,6 +421,7 @@ function renderWeek() {
     col.className = 'week-day-col';
     col.style.height = `${60 * 24}px`;
 
+    // Hour lines
     HOURS.forEach(h => {
       const line = document.createElement('div');
       line.className = 'hour-line';
@@ -370,6 +429,7 @@ function renderWeek() {
       col.appendChild(line);
     });
 
+    // Click to add
     col.addEventListener('click', (e) => {
       if (e.target.classList.contains('week-event')) return;
       const rect = col.getBoundingClientRect();
@@ -386,6 +446,28 @@ function renderWeek() {
       });
     });
 
+    // All-day events shown as banners at top of column
+    const allDayEvs = visibleEvents().filter(ev => {
+      if (!ev.allDay) return false;
+      const evDate = new Date(ev.start); evDate.setHours(0,0,0,0);
+      const colDate = new Date(d); colDate.setHours(0,0,0,0);
+      return evDate.getTime() === colDate.getTime();
+    });
+    allDayEvs.forEach((ev, idx) => {
+      const cfg = CONFIG.MEMBERS[ev.member] || CONFIG.MEMBERS.Madeleine;
+      const evEl = document.createElement('div');
+      evEl.className = 'week-event';
+      evEl.style.top = (idx * 26) + 'px';
+      evEl.style.height = '22px';
+      evEl.style.background = cfg.color;
+      evEl.style.color = '#fff';
+      evEl.style.zIndex = '2';
+      evEl.innerHTML = '<div class="ev-title">' + ev.title.replace(/^\[.*?\]\s*/, '') + '</div>';
+      evEl.addEventListener('click', e => { e.stopPropagation(); openEventEditor(ev); });
+      col.appendChild(evEl);
+    });
+
+    // Timed events for this day
     const dayEvents = visibleEvents().filter(ev => {
       if (ev.allDay) return false;
       const evDate = new Date(ev.start); evDate.setHours(0,0,0,0);
@@ -405,7 +487,7 @@ function renderWeek() {
       evEl.style.height = `${height}px`;
       evEl.style.background = cfg.color;
       evEl.style.color = '#fff';
-      evEl.innerHTML = `<div class="ev-title">${ev.title.replace(/^\[.*?\]\s*/, '')}</div>${height > 40 ? `<div class="ev-time">${fmtTime(ev.start)}-${fmtTime(ev.end)}</div>` : ''}`;
+      evEl.innerHTML = `<div class="ev-title">${ev.title.replace(/^\[.*?\]\s*/, '')}</div>${height > 40 ? `<div class="ev-time">${fmtTime(ev.start)}–${fmtTime(ev.end)}</div>` : ''}`;
       evEl.addEventListener('click', e => { e.stopPropagation(); openEventEditor(ev); });
       col.appendChild(evEl);
     });
@@ -414,6 +496,7 @@ function renderWeek() {
   }
 }
 
+// ── Month View ───────────────────────────────────────────────
 function renderMonth() {
   const grid = document.getElementById('month-grid');
   grid.innerHTML = '';
@@ -469,11 +552,15 @@ function renderMonth() {
       cell.appendChild(more);
     }
 
-    cell.addEventListener('click', () => { openModal({ date: formatDate(d) }); });
+    cell.addEventListener('click', () => {
+      openModal({ date: formatDate(d) });
+    });
+
     grid.appendChild(cell);
   }
 }
 
+// ── Agenda View ──────────────────────────────────────────────
 function renderAgenda() {
   const list = document.getElementById('agenda-list');
   list.innerHTML = '';
@@ -532,7 +619,7 @@ function renderAgenda() {
 
       const meta = document.createElement('div');
       meta.className = 'agenda-meta';
-      meta.textContent = ev.allDay ? 'All day' : `${fmtTime(ev.start)} - ${fmtTime(ev.end)}`;
+      meta.textContent = ev.allDay ? 'All day' : `${fmtTime(ev.start)} – ${fmtTime(ev.end)}`;
 
       const badge = document.createElement('span');
       badge.className = 'agenda-member';
@@ -553,6 +640,7 @@ function renderAgenda() {
   });
 }
 
+// ─── Edit Existing Event ────────────────────────────────────
 function openEventEditor(ev) {
   openModal({
     id: ev.id,
@@ -567,6 +655,7 @@ function openEventEditor(ev) {
   });
 }
 
+// ─── Helpers ────────────────────────────────────────────────
 function formatDate(d) {
   return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`;
 }
@@ -585,16 +674,13 @@ function showToast(msg) {
   setTimeout(() => t.classList.add('hidden'), 2800);
 }
 
+// --- Load Google API -------------------------------------
 (function loadGoogleAPIs() {
   const gapiScript = document.createElement('script');
   gapiScript.src = 'https://apis.google.com/js/api.js';
   gapiScript.onload = gapiLoaded;
   document.head.appendChild(gapiScript);
-
-  const gisScript = document.createElement('script');
-  gisScript.src = 'https://accounts.google.com/gsi/client';
-  gisScript.onload = gisLoaded;
-  document.head.appendChild(gisScript);
 })();
 
+// Initial render
 renderCurrentView();

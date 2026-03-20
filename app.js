@@ -8,8 +8,6 @@ let currentDate = new Date();
 let events = [];
 let editingEventId = null;
 let hiddenMembers = new Set();
-let eventsLoaded = false; // FIX 3: guard flag to prevent double-loading
-
 // ─── Google API Init ──────────────────────────────────────
 function gapiLoaded() {
   gapi.load('client', async () => {
@@ -28,7 +26,6 @@ function gisLoaded() {
     scope: CONFIG.SCOPES,
     callback: async (resp) => {
       if (resp.error) { console.error(resp); return; }
-      eventsLoaded = true; // FIX 3: mark as loaded so maybeEnableButtons won't fire again
       showApp();
       await loadEvents();
     },
@@ -42,11 +39,7 @@ function maybeEnableButtons() {
     document.getElementById('sign-in-btn').disabled = false;
     // Auto-sign in if token exists
     const token = gapi.client.getToken();
-    if (token !== null && !eventsLoaded) { // FIX 3: only run if not already loaded
-      eventsLoaded = true;
-      showApp();
-      loadEvents();
-    }
+    if (token !== null) { showApp(); loadEvents(); }
   }
 }
 
@@ -64,7 +57,6 @@ document.getElementById('sign-out-btn').addEventListener('click', () => {
   if (token !== null) {
     google.accounts.oauth2.revoke(token.access_token, () => {
       gapi.client.setToken('');
-      eventsLoaded = false; // FIX 3: reset guard on sign-out
       document.getElementById('auth-screen').classList.add('active');
       document.getElementById('main-screen').classList.remove('active');
     });

@@ -8,6 +8,7 @@ let currentDate = new Date();
 let events = [];
 let editingEventId = null;
 let hiddenMembers = new Set();
+let eventsLoaded = false; // FIX 3: guard flag to prevent double-loading
 
 // ─── Google API Init ──────────────────────────────────────
 function gapiLoaded() {
@@ -27,6 +28,7 @@ function gisLoaded() {
     scope: CONFIG.SCOPES,
     callback: async (resp) => {
       if (resp.error) { console.error(resp); return; }
+      eventsLoaded = true; // FIX 3: mark as loaded so maybeEnableButtons won't fire again
       showApp();
       await loadEvents();
     },
@@ -40,7 +42,11 @@ function maybeEnableButtons() {
     document.getElementById('sign-in-btn').disabled = false;
     // Auto-sign in if token exists
     const token = gapi.client.getToken();
-    if (token !== null) { showApp(); loadEvents(); }
+    if (token !== null && !eventsLoaded) { // FIX 3: only run if not already loaded
+      eventsLoaded = true;
+      showApp();
+      loadEvents();
+    }
   }
 }
 
@@ -58,6 +64,7 @@ document.getElementById('sign-out-btn').addEventListener('click', () => {
   if (token !== null) {
     google.accounts.oauth2.revoke(token.access_token, () => {
       gapi.client.setToken('');
+      eventsLoaded = false; // FIX 3: reset guard on sign-out
       document.getElementById('auth-screen').classList.add('active');
       document.getElementById('main-screen').classList.remove('active');
     });
@@ -80,13 +87,14 @@ function showApp() {
 
 // ─── Load Events ───────────────────────────────────────────
 async function loadEvents() {
+  events = []; // FIX 1 & 2: always clear before loading to prevent accumulation
   try {
     const now = new Date();
     const start = new Date(now.getFullYear(), now.getMonth() - 2, 1);
     const end = new Date(now.getFullYear(), now.getMonth() + 4, 0);
 
     const resp = await gapi.client.calendar.events.list({
-      calendarId: 'theredhouse7@gmail.com',
+      calendarId: 'primary',
       timeMin: start.toISOString(),
       timeMax: end.toISOString(),
       showDeleted: false,
@@ -169,14 +177,14 @@ async function saveEvent() {
   try {
     if (editingEventId) {
       await gapi.client.calendar.events.update({
-        calendarId: 'theredhouse7@gmail.com',
+        calendarId: 'primary',
         eventId: editingEventId,
         resource: eventBody,
       });
       showToast('Event updated ✓');
     } else {
       await gapi.client.calendar.events.insert({
-        calendarId: 'theredhouse7@gmail.com',
+        calendarId: 'primary',
         resource: eventBody,
       });
       showToast('Event added ✓');
@@ -195,7 +203,7 @@ async function deleteEvent() {
   if (!confirm('Delete this event?')) return;
   try {
     await gapi.client.calendar.events.delete({
-      calendarId: 'theredhouse7@gmail.com',
+      calendarId: 'primary',
       eventId: editingEventId,
     });
     showToast('Event deleted');

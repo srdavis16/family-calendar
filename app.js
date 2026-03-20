@@ -1,15 +1,14 @@
-// ─────────────────────────────────────────────────────────
-//  FAMILY CALENDAR — MAIN APP
-// ─────────────────────────────────────────────────────────
+// ---------------------------------------------------------
+//  FAMILY CALENDAR - MAIN APP
+// ---------------------------------------------------------
 
-let gapiInited = false;
+let tokenClient, gapiInited = false, gisInited = false;
 let currentView = 'week';
 let currentDate = new Date();
 let events = [];
 let editingEventId = null;
 let hiddenMembers = new Set();
 
-// ─── Google API Init ──────────────────────────────────────
 function gapiLoaded() {
   gapi.load('client', async () => {
     await gapi.client.init({
@@ -17,119 +16,65 @@ function gapiLoaded() {
       discoveryDocs: [CONFIG.DISCOVERY_DOC],
     });
     gapiInited = true;
-    checkStoredToken();
+    maybeEnableButtons();
   });
 }
 
-// ─── Redirect-based Auth ──────────────────────────────────
-function buildAuthUrl() {
-  const params = new URLSearchParams({
+function gisLoaded() {
+  tokenClient = google.accounts.oauth2.initTokenClient({
     client_id: CONFIG.GOOGLE_CLIENT_ID,
-    redirect_uri: window.location.origin + window.location.pathname,
-    response_type: 'token',
     scope: CONFIG.SCOPES,
-    include_granted_scopes: 'true',
+    callback: async (resp) => {
+      if (resp.error) { console.error(resp); return; }
+      showApp();
+      await loadEvents();
+    },
   });
-  return `https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`;
+  gisInited = true;
+  maybeEnableButtons();
 }
 
-function handleRedirectToken() {
-  const fullHash = window.location.hash;
-  console.log('[Auth] Hash on load:', fullHash || '(empty)');
-
-  const hash = fullHash.substring(1);
-  if (!hash) {
-    console.log('[Auth] No hash — not a redirect callback.');
-    return false;
-  }
-
-  const params = new URLSearchParams(hash);
-  const accessToken = params.get('access_token');
-  const expiresIn = params.get('expires_in');
-  const error = params.get('error');
-
-  if (error) {
-    console.error('[Auth] Google returned error:', error);
-    return false;
-  }
-  if (!accessToken) {
-    console.warn('[Auth] Hash found but no access_token. Hash was:', hash);
-    return false;
-  }
-
-  console.log('[Auth] Token received! Expires in:', expiresIn, 'seconds');
-  const expiresAt = Date.now() + parseInt(expiresIn) * 1000;
-  sessionStorage.setItem('gapi_token', accessToken);
-  sessionStorage.setItem('gapi_token_expires', expiresAt);
-  history.replaceState(null, '', window.location.pathname);
-  return true;
-}
-
-function checkStoredToken() {
-  const token = sessionStorage.getItem('gapi_token');
-  const expiresAt = parseInt(sessionStorage.getItem('gapi_token_expires') || '0');
-  const expired = Date.now() > expiresAt;
-  console.log('[Auth] Stored token:', token ? 'found' : 'none', '| Expired:', expired);
-
-  if (token && !expired) {
-    console.log('[Auth] Valid token — loading app.');
-    gapi.client.setToken({ access_token: token });
-    showApp();
-    loadEvents();
-  } else {
-    console.log('[Auth] No valid token — showing sign-in.');
-    sessionStorage.removeItem('gapi_token');
-    sessionStorage.removeItem('gapi_token_expires');
+function maybeEnableButtons() {
+  if (gapiInited && gisInited) {
     document.getElementById('sign-in-btn').disabled = false;
+    const token = gapi.client.getToken();
+    if (token !== null) { showApp(); loadEvents(); }
   }
 }
 
-// Grab token from URL hash immediately on page load (before gapi loads)
-handleRedirectToken();
-
-// ─── Auth Buttons ─────────────────────────────────────────
 document.getElementById('sign-in-btn').addEventListener('click', () => {
-  const url = buildAuthUrl();
-  console.log('[Auth] Redirecting to:', url);
-  window.location.href = url;
+  if (gapi.client.getToken() === null) {
+    tokenClient.requestAccessToken({ prompt: 'consent' });
+  } else {
+    tokenClient.requestAccessToken({ prompt: '' });
+  }
 });
 
 document.getElementById('sign-out-btn').addEventListener('click', () => {
-  const token = sessionStorage.getItem('gapi_token');
-  if (token) {
-    fetch(`https://oauth2.googleapis.com/revoke?token=${token}`, { method: 'POST' })
-      .finally(() => {
-        sessionStorage.removeItem('gapi_token');
-        sessionStorage.removeItem('gapi_token_expires');
-        gapi.client.setToken('');
-        document.getElementById('auth-screen').classList.add('active');
-        document.getElementById('main-screen').classList.remove('active');
-      });
+  const token = gapi.client.getToken();
+  if (token !== null) {
+    google.accounts.oauth2.revoke(token.access_token, () => {
+      gapi.client.setToken('');
+      document.getElementById('auth-screen').classList.add('active');
+      document.getElementById('main-screen').classList.remove('active');
+    });
   }
 });
 
 function showApp() {
   document.getElementById('auth-screen').classList.remove('active');
   document.getElementById('main-screen').classList.add('active');
-  const token = sessionStorage.getItem('gapi_token');
+  gapi.client.people?.profiles.get({ resourceName: 'people/me' });
   fetch('https://www.googleapis.com/oauth2/v2/userinfo', {
-    headers: { Authorization: `Bearer ${token}` }
+    headers: { Authorization: `Bearer ${gapi.client.getToken().access_token}` }
   }).then(r => r.json()).then(u => {
     const name = u.given_name || u.name || 'You';
     document.getElementById('user-name').textContent = name;
     document.getElementById('user-avatar').textContent = name[0].toUpperCase();
-  }).catch(err => console.error('[Auth] userinfo fetch failed:', err));
+  }).catch(() => {});
 }
 
-// ─── Load Events ───────────────────────────────────────────
 async function loadEvents() {
-  const token = sessionStorage.getItem('gapi_token');
-  if (!token) {
-    console.warn('[Events] No token — skipping loadEvents.');
-    return;
-  }
-  console.log('[Events] Loading events...');
-  events = [];
   try {
     const now = new Date();
     const start = new Date(now.getFullYear(), now.getMonth() - 2, 1);
@@ -146,10 +91,9 @@ async function loadEvents() {
     });
 
     events = (resp.result.items || []).map(e => parseGoogleEvent(e));
-    console.log('[Events] Loaded', events.length, 'events.');
     renderCurrentView();
   } catch (err) {
-    console.error('[Events] Error loading events:', err);
+    console.error('Error loading events:', err);
     showToast('Error loading calendar events');
   }
 }
@@ -182,7 +126,6 @@ function detectMember(title, desc) {
   return 'Madeleine';
 }
 
-// ─── Save Event ────────────────────────────────────────────
 async function saveEvent() {
   const title = document.getElementById('event-title').value.trim();
   if (!title) { showToast('Please enter a title'); return; }
@@ -224,13 +167,13 @@ async function saveEvent() {
         eventId: editingEventId,
         resource: eventBody,
       });
-      showToast('Event updated ✓');
+      showToast('Event updated');
     } else {
       await gapi.client.calendar.events.insert({
         calendarId: 'primary',
         resource: eventBody,
       });
-      showToast('Event added ✓');
+      showToast('Event added');
     }
     closeModal();
     await loadEvents();
@@ -240,7 +183,6 @@ async function saveEvent() {
   }
 }
 
-// ─── Delete Event ──────────────────────────────────────────
 async function deleteEvent() {
   if (!editingEventId) return;
   if (!confirm('Delete this event?')) return;
@@ -257,7 +199,6 @@ async function deleteEvent() {
   }
 }
 
-// ─── Modal ──────────────────────────────────────────────────
 function openModal(opts = {}) {
   editingEventId = opts.id || null;
   document.getElementById('modal-title').textContent = opts.id ? 'Edit Event' : 'New Event';
@@ -312,7 +253,6 @@ document.querySelectorAll('.member-btn').forEach(btn => {
   });
 });
 
-// ─── Views ──────────────────────────────────────────────────
 document.querySelectorAll('.nav-btn').forEach(btn => {
   btn.addEventListener('click', () => {
     document.querySelectorAll('.nav-btn').forEach(b => b.classList.remove('active'));
@@ -324,8 +264,8 @@ document.querySelectorAll('.nav-btn').forEach(btn => {
   });
 });
 
-document.getElementById('prev-btn').addEventListener('click', () => navigate(-1));
-document.getElementById('next-btn').addEventListener('click', () => navigate(1));
+document.getElementById('prev-btn').addEventListener('click', () => { navigate(-1); });
+document.getElementById('next-btn').addEventListener('click', () => { navigate(1); });
 document.getElementById('today-btn').addEventListener('click', () => {
   currentDate = new Date();
   renderCurrentView();
@@ -342,7 +282,6 @@ function navigate(dir) {
   renderCurrentView();
 }
 
-// ─── Member Filters ─────────────────────────────────────────
 document.querySelectorAll('.member-toggle').forEach(toggle => {
   toggle.addEventListener('change', () => {
     if (toggle.checked) hiddenMembers.delete(toggle.dataset.member);
@@ -355,7 +294,6 @@ function visibleEvents() {
   return events.filter(e => !hiddenMembers.has(e.member));
 }
 
-// ─── Render ─────────────────────────────────────────────────
 function renderCurrentView() {
   updateHeaderTitle();
   if (currentView === 'week') renderWeek();
@@ -370,9 +308,9 @@ function updateHeaderTitle() {
     const start = getWeekStart(currentDate);
     const end = new Date(start); end.setDate(end.getDate() + 6);
     if (start.getMonth() === end.getMonth()) {
-      el.textContent = `${start.toLocaleDateString('en-US', { month: 'long' })} ${start.getDate()}–${end.getDate()}, ${start.getFullYear()}`;
+      el.textContent = `${start.toLocaleDateString('en-US', { month: 'long' })} ${start.getDate()}-${end.getDate()}, ${start.getFullYear()}`;
     } else {
-      el.textContent = `${start.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })} – ${end.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })}`;
+      el.textContent = `${start.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })} - ${end.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })}`;
     }
   } else if (currentView === 'month') {
     el.textContent = currentDate.toLocaleDateString('en-US', opts);
@@ -381,10 +319,10 @@ function updateHeaderTitle() {
   }
 }
 
-// ── Week View ────────────────────────────────────────────────
 function getWeekStart(d) {
   const day = new Date(d);
-  day.setDate(day.getDate() - day.getDay());
+  const diff = day.getDay();
+  day.setDate(day.getDate() - diff);
   day.setHours(0, 0, 0, 0);
   return day;
 }
@@ -467,7 +405,7 @@ function renderWeek() {
       evEl.style.height = `${height}px`;
       evEl.style.background = cfg.color;
       evEl.style.color = '#fff';
-      evEl.innerHTML = `<div class="ev-title">${ev.title.replace(/^\[.*?\]\s*/, '')}</div>${height > 40 ? `<div class="ev-time">${fmtTime(ev.start)}–${fmtTime(ev.end)}</div>` : ''}`;
+      evEl.innerHTML = `<div class="ev-title">${ev.title.replace(/^\[.*?\]\s*/, '')}</div>${height > 40 ? `<div class="ev-time">${fmtTime(ev.start)}-${fmtTime(ev.end)}</div>` : ''}`;
       evEl.addEventListener('click', e => { e.stopPropagation(); openEventEditor(ev); });
       col.appendChild(evEl);
     });
@@ -476,7 +414,6 @@ function renderWeek() {
   }
 }
 
-// ── Month View ───────────────────────────────────────────────
 function renderMonth() {
   const grid = document.getElementById('month-grid');
   grid.innerHTML = '';
@@ -532,12 +469,11 @@ function renderMonth() {
       cell.appendChild(more);
     }
 
-    cell.addEventListener('click', () => openModal({ date: formatDate(d) }));
+    cell.addEventListener('click', () => { openModal({ date: formatDate(d) }); });
     grid.appendChild(cell);
   }
 }
 
-// ── Agenda View ──────────────────────────────────────────────
 function renderAgenda() {
   const list = document.getElementById('agenda-list');
   list.innerHTML = '';
@@ -596,7 +532,7 @@ function renderAgenda() {
 
       const meta = document.createElement('div');
       meta.className = 'agenda-meta';
-      meta.textContent = ev.allDay ? 'All day' : `${fmtTime(ev.start)} – ${fmtTime(ev.end)}`;
+      meta.textContent = ev.allDay ? 'All day' : `${fmtTime(ev.start)} - ${fmtTime(ev.end)}`;
 
       const badge = document.createElement('span');
       badge.className = 'agenda-member';
@@ -617,7 +553,6 @@ function renderAgenda() {
   });
 }
 
-// ─── Edit Existing Event ────────────────────────────────────
 function openEventEditor(ev) {
   openModal({
     id: ev.id,
@@ -632,7 +567,6 @@ function openEventEditor(ev) {
   });
 }
 
-// ─── Helpers ────────────────────────────────────────────────
 function formatDate(d) {
   return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`;
 }
@@ -651,13 +585,16 @@ function showToast(msg) {
   setTimeout(() => t.classList.add('hidden'), 2800);
 }
 
-// ─── Load Google API ─────────────────────────────────────────
 (function loadGoogleAPIs() {
   const gapiScript = document.createElement('script');
   gapiScript.src = 'https://apis.google.com/js/api.js';
   gapiScript.onload = gapiLoaded;
   document.head.appendChild(gapiScript);
+
+  const gisScript = document.createElement('script');
+  gisScript.src = 'https://accounts.google.com/gsi/client';
+  gisScript.onload = gisLoaded;
+  document.head.appendChild(gisScript);
 })();
 
-// Initial render
 renderCurrentView();

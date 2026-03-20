@@ -335,13 +335,7 @@ function navigate(dir) {
 }
 
 // ─── Member Filters ─────────────────────────────────────────
-document.querySelectorAll('.member-toggle').forEach(toggle => {
-  toggle.addEventListener('change', () => {
-    if (toggle.checked) hiddenMembers.delete(toggle.dataset.member);
-    else hiddenMembers.add(toggle.dataset.member);
-    renderCurrentView();
-  });
-});
+// member toggles handled below with mobile sync
 
 function visibleEvents() {
   return events.filter(e => !hiddenMembers.has(e.member));
@@ -681,6 +675,58 @@ function showToast(msg) {
   gapiScript.onload = gapiLoaded;
   document.head.appendChild(gapiScript);
 })();
+
+
+// --- Mobile Nav ------------------------------------------
+document.querySelectorAll('.mobile-nav-btn[data-view]').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.mobile-nav-btn').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    // Also sync the sidebar nav
+    document.querySelectorAll('.nav-btn').forEach(b => b.classList.remove('active'));
+    const sideBtn = document.querySelector('.nav-btn[data-view="' + btn.dataset.view + '"]');
+    if (sideBtn) sideBtn.classList.add('active');
+    currentView = btn.dataset.view;
+    document.querySelectorAll('.calendar-view').forEach(v => v.classList.remove('active'));
+    document.getElementById(currentView + '-view').classList.add('active');
+    renderCurrentView();
+  });
+});
+
+const mobileAddBtn = document.getElementById('mobile-add-btn');
+if (mobileAddBtn) mobileAddBtn.addEventListener('click', () => openModal());
+
+const mobileFilterBtn = document.getElementById('mobile-filter-btn');
+const mobileDrawer = document.getElementById('mobile-drawer');
+if (mobileFilterBtn && mobileDrawer) {
+  mobileFilterBtn.addEventListener('click', () => {
+    const isOpen = mobileDrawer.style.display !== 'none';
+    mobileDrawer.style.display = isOpen ? 'none' : 'block';
+    mobileFilterBtn.classList.toggle('active', !isOpen);
+  });
+  // Close drawer when tapping outside
+  document.addEventListener('click', e => {
+    if (mobileDrawer.style.display !== 'none' &&
+        !mobileDrawer.contains(e.target) &&
+        e.target !== mobileFilterBtn) {
+      mobileDrawer.style.display = 'none';
+      mobileFilterBtn.classList.remove('active');
+    }
+  });
+}
+
+// Keep mobile member toggles in sync with sidebar toggles
+document.querySelectorAll('.member-toggle').forEach(toggle => {
+  toggle.addEventListener('change', () => {
+    // Sync all toggles with same data-member
+    document.querySelectorAll('.member-toggle[data-member="' + toggle.dataset.member + '"]').forEach(t => {
+      t.checked = toggle.checked;
+    });
+    if (toggle.checked) hiddenMembers.delete(toggle.dataset.member);
+    else hiddenMembers.add(toggle.dataset.member);
+    renderCurrentView();
+  });
+});
 
 // Initial render
 renderCurrentView();

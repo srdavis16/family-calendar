@@ -1,7 +1,6 @@
 // ─────────────────────────────────────────────────────────
 //  FAMILY CALENDAR — MAIN APP
 // ─────────────────────────────────────────────────────────
-
 let tokenClient, gapiInited = false, gisInited = false;
 let currentView = 'week';
 let currentDate = new Date();
@@ -25,7 +24,11 @@ function gisLoaded() {
     client_id: CONFIG.GOOGLE_CLIENT_ID,
     scope: CONFIG.SCOPES,
     callback: async (resp) => {
-      if (resp.error) { console.error(resp); return; }
+      if (resp.error) {
+        console.error('OAuth error:', resp.error);
+        showToast('Sign-in failed. Please try again.');
+        return;
+      }
       showApp();
       await loadEvents();
     },
@@ -46,7 +49,7 @@ function maybeEnableButtons() {
 // ─── Auth ──────────────────────────────────────────────────
 document.getElementById('sign-in-btn').addEventListener('click', () => {
   if (gapi.client.getToken() === null) {
-    tokenClient.requestAccessToken({ prompt: 'consent' });
+    tokenClient.requestAccessToken({ prompt: 'select_account' });
   } else {
     tokenClient.requestAccessToken({ prompt: '' });
   }
@@ -79,7 +82,12 @@ function showApp() {
 
 // ─── Load Events ───────────────────────────────────────────
 async function loadEvents() {
-  events = []; // FIX 1 & 2: always clear before loading to prevent accumulation
+  const token = gapi.client.getToken();
+  if (!token || !token.access_token) {
+    console.warn('loadEvents called without a valid token — skipping.');
+    return;
+  }
+  events = [];
   try {
     const now = new Date();
     const start = new Date(now.getFullYear(), now.getMonth() - 2, 1);

@@ -22,10 +22,6 @@ function gapiLoaded() {
 }
 
 // ─── Redirect-based Auth ──────────────────────────────────
-// Replaces the popup flow (which COOP policy blocks on GitHub Pages).
-// We redirect to Google, receive the token back in the URL hash,
-// store it in sessionStorage, and restore it on the next load.
-
 function buildAuthUrl() {
   const params = new URLSearchParams({
     client_id: CONFIG.GOOGLE_CLIENT_ID,
@@ -38,20 +34,33 @@ function buildAuthUrl() {
 }
 
 function handleRedirectToken() {
-  // After Google redirects back, the access token is in the URL hash
-  const hash = window.location.hash.substring(1);
-  if (!hash) return false;
+  const fullHash = window.location.hash;
+  console.log('[Auth] Hash on load:', fullHash || '(empty)');
+
+  const hash = fullHash.substring(1);
+  if (!hash) {
+    console.log('[Auth] No hash — not a redirect callback.');
+    return false;
+  }
+
   const params = new URLSearchParams(hash);
   const accessToken = params.get('access_token');
   const expiresIn = params.get('expires_in');
-  if (!accessToken) return false;
+  const error = params.get('error');
 
-  // Store token and expiry time in sessionStorage
+  if (error) {
+    console.error('[Auth] Google returned error:', error);
+    return false;
+  }
+  if (!accessToken) {
+    console.warn('[Auth] Hash found but no access_token. Hash was:', hash);
+    return false;
+  }
+
+  console.log('[Auth] Token received! Expires in:', expiresIn, 'seconds');
   const expiresAt = Date.now() + parseInt(expiresIn) * 1000;
   sessionStorage.setItem('gapi_token', accessToken);
   sessionStorage.setItem('gapi_token_expires', expiresAt);
-
-  // Remove the token from the URL bar so it's not visible or bookmarked
   history.replaceState(null, '', window.location.pathname);
   return true;
 }
@@ -59,26 +68,30 @@ function handleRedirectToken() {
 function checkStoredToken() {
   const token = sessionStorage.getItem('gapi_token');
   const expiresAt = parseInt(sessionStorage.getItem('gapi_token_expires') || '0');
+  const expired = Date.now() > expiresAt;
+  console.log('[Auth] Stored token:', token ? 'found' : 'none', '| Expired:', expired);
 
-  if (token && Date.now() < expiresAt) {
-    // Valid token found — apply it to gapi and load the app
+  if (token && !expired) {
+    console.log('[Auth] Valid token — loading app.');
     gapi.client.setToken({ access_token: token });
     showApp();
     loadEvents();
   } else {
-    // No valid token — clear stale data and show sign-in screen
+    console.log('[Auth] No valid token — showing sign-in.');
     sessionStorage.removeItem('gapi_token');
     sessionStorage.removeItem('gapi_token_expires');
     document.getElementById('sign-in-btn').disabled = false;
   }
 }
 
-// Run immediately on page load to catch the token from Google's redirect
+// Grab token from URL hash immediately on page load (before gapi loads)
 handleRedirectToken();
 
 // ─── Auth Buttons ─────────────────────────────────────────
 document.getElementById('sign-in-btn').addEventListener('click', () => {
-  window.location.href = buildAuthUrl();
+  const url = buildAuthUrl();
+  console.log('[Auth] Redirecting to:', url);
+  window.location.href = url;
 });
 
 document.getElementById('sign-out-btn').addEventListener('click', () => {
@@ -105,16 +118,17 @@ function showApp() {
     const name = u.given_name || u.name || 'You';
     document.getElementById('user-name').textContent = name;
     document.getElementById('user-avatar').textContent = name[0].toUpperCase();
-  }).catch(() => {});
+  }).catch(err => console.error('[Auth] userinfo fetch failed:', err));
 }
 
 // ─── Load Events ───────────────────────────────────────────
 async function loadEvents() {
   const token = sessionStorage.getItem('gapi_token');
   if (!token) {
-    console.warn('loadEvents called without a valid token — skipping.');
+    console.warn('[Events] No token — skipping loadEvents.');
     return;
   }
+  console.log('[Events] Loading events...');
   events = [];
   try {
     const now = new Date();
@@ -132,9 +146,10 @@ async function loadEvents() {
     });
 
     events = (resp.result.items || []).map(e => parseGoogleEvent(e));
+    console.log('[Events] Loaded', events.length, 'events.');
     renderCurrentView();
   } catch (err) {
-    console.error('Error loading events:', err);
+    console.error('[Events] Error loading events:', err);
     showToast('Error loading calendar events');
   }
 }
@@ -164,7 +179,7 @@ function detectMember(title, desc) {
   for (const name of Object.keys(CONFIG.MEMBERS)) {
     if (text.includes(name.toLowerCase())) return name;
   }
-  return 'Madeleine'; // default
+  return 'Madeleine';
 }
 
 // ─── Save Event ────────────────────────────────────────────
@@ -369,8 +384,7 @@ function updateHeaderTitle() {
 // ── Week View ────────────────────────────────────────────────
 function getWeekStart(d) {
   const day = new Date(d);
-  const diff = day.getDay();
-  day.setDate(day.getDate() - diff);
+  day.setDate(day.getDate() - day.getDay());
   day.setHours(0, 0, 0, 0);
   return day;
 }

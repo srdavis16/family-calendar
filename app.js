@@ -17,6 +17,9 @@ function gapiLoaded() {
       discoveryDocs: [CONFIG.DISCOVERY_DOC],
     });
     gapiInited = true;
+    // Handle the redirect token INSIDE gapiLoaded so gapi.client is ready
+    // before we call setToken or loadEvents
+    handleRedirectToken();
     checkStoredToken();
   });
 }
@@ -56,12 +59,8 @@ function checkStoredToken() {
   } else {
     sessionStorage.removeItem('gapi_token');
     sessionStorage.removeItem('gapi_token_expires');
-    document.getElementById('sign-in-btn').disabled = false;
   }
 }
-
-// Grab token from URL hash right away on page load
-handleRedirectToken();
 
 // --- Auth Buttons ----------------------------------------
 document.getElementById('sign-in-btn').addEventListener('click', () => {
